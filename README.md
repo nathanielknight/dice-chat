@@ -1,0 +1,54 @@
+# Dice Chat
+
+One-off chat rooms with integrated dice rolling, for casual tabletop play.
+See [SPEC.md](SPEC.md) for the full specification.
+
+A single binary plus a SQLite file is a complete installation. Rooms are
+joined via share link — no accounts. Rooms become read-only 14 days after
+creation and are deleted after a year.
+
+## Running
+
+```sh
+cargo build --release
+./target/release/dice-chat                # sqlite://dice-chat.db, 127.0.0.1:8080
+```
+
+Configuration is via environment variables:
+
+| Variable       | Default               | Notes |
+|----------------|-----------------------|-------|
+| `DATABASE_URL` | `sqlite://dice-chat.db` | `sqlite://<path>` or `postgres://user:pw@host/db` |
+| `BIND_ADDR`    | `127.0.0.1:8080`      | listen address |
+
+The storage backend is selected by the connection string; the schema is
+created automatically on first start.
+
+## Dice notation
+
+Post `/roll <expression>` in a room. The notation (SPEC.md §8) is a subset
+of the de facto Roll20 conventions:
+
+- `2d6+3`, `1d8 + 1d6 + 2`, `2d6*3` — arithmetic (`*` binds tighter)
+- `d20adv` / `d20dis` — advantage / disadvantage
+- `4d6kh3`, `4d6dl1` — keep/drop highest/lowest
+- `10d6!` — exploding dice; `r2` / `ro2` — reroll faces ≤ 2 (indefinitely / once)
+- `8d10>=7` — count successes (`>` and `<` are strict)
+- `dF` — Fate dice, `d%` — percentile
+
+Editing a text message replaces its body; editing a roll **re-rolls it**
+with fresh randomness. Anyone in the room can edit any message — it's a
+casual-play trust model.
+
+## Development
+
+```sh
+cargo test          # dice crate + storage conformance (SQLite in-memory)
+DICE_CHAT_TEST_POSTGRES=postgres://user:pw@localhost/dice_chat_test cargo test
+```
+
+The workspace has two crates: `dice` (parser/evaluator, no I/O) and
+`server` (axum web app, SQLite/Postgres storage behind a `Store` trait).
+Live updates are server-sent events carrying rendered HTML fragments that
+htmx swaps in place; static assets (htmx and its SSE extension) are
+embedded in the binary.

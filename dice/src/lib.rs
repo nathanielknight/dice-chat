@@ -24,20 +24,20 @@ const MAX_REROLLS_PER_DIE: u32 = 1_000;
 
 // ------------------------------------------------------------------- AST
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AddOp {
     Add,
     Sub,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Sides {
     Faces(u32),
     /// Fate/Fudge die: −1, 0, +1.
     Fate,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KeepKind {
     KeepHighest,
     KeepLowest,
@@ -45,7 +45,7 @@ pub enum KeepKind {
     DropLowest,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RerollKind {
     /// `r n` — reroll faces ≤ n until above n.
     Indefinite,
@@ -53,7 +53,7 @@ pub enum RerollKind {
     Once,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Cmp {
     Ge,
     Le,
@@ -72,7 +72,7 @@ impl Cmp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiceTerm {
     pub count: u32,
     pub sides: Sides,
@@ -82,19 +82,19 @@ pub struct DiceTerm {
     pub success: Option<(Cmp, i64)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Term {
     Const(i64),
     Dice(DiceTerm),
 }
 
 /// A product of terms: `t1 * t2 * …`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Product(pub Vec<Term>);
 
 /// A parsed expression: sum/difference of products.
 /// `*` binds tighter than `+`/`-`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Expr(pub Vec<(AddOp, Product)>);
 
 // ---------------------------------------------------------------- errors
@@ -434,6 +434,87 @@ impl<'a> Parser<'a> {
     }
 }
 
+// ------------------------------------------------------------ rendering
+
+impl std::fmt::Display for Sides {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Sides::Fate => write!(f, "F"),
+            Sides::Faces(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Cmp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Cmp::Ge => ">=",
+            Cmp::Le => "<=",
+            Cmp::Gt => ">",
+            Cmp::Lt => "<",
+        })
+    }
+}
+
+/// Canonical notation for a dice term (sugar like `adv` prints desugared).
+impl std::fmt::Display for DiceTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}d{}", self.count, self.sides)?;
+        if let Some((kind, n)) = self.reroll {
+            let k = match kind {
+                RerollKind::Indefinite => "r",
+                RerollKind::Once => "ro",
+            };
+            write!(f, "{k}{n}")?;
+        }
+        if self.explode {
+            write!(f, "!")?;
+        }
+        if let Some((kind, n)) = self.keep {
+            let k = match kind {
+                KeepKind::KeepHighest => "kh",
+                KeepKind::KeepLowest => "kl",
+                KeepKind::DropHighest => "dh",
+                KeepKind::DropLowest => "dl",
+            };
+            write!(f, "{k}{n}")?;
+        }
+        if let Some((cmp, n)) = self.success {
+            write!(f, "{cmp}{n}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for Term {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Term::Const(n) => write!(f, "{n}"),
+            Term::Dice(dt) => write!(f, "{dt}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Expr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, (op, Product(terms))) in self.0.iter().enumerate() {
+            match (i, op) {
+                (0, AddOp::Add) => {}
+                (0, AddOp::Sub) => write!(f, "-")?,
+                (_, AddOp::Add) => write!(f, " + ")?,
+                (_, AddOp::Sub) => write!(f, " - ")?,
+            }
+            for (j, term) in terms.iter().enumerate() {
+                if j > 0 {
+                    write!(f, " * ")?;
+                }
+                write!(f, "{term}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ------------------------------------------------------------- evaluator
 
 /// Source of randomness. `roll(sides)` must return a value in `1..=sides`.
@@ -442,7 +523,7 @@ pub trait Roller {
 }
 
 /// One physical die in the outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Die {
     /// Final face value (−1..=1 for Fate dice).
     pub value: i64,
@@ -456,7 +537,7 @@ pub struct Die {
     pub success: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TermOutcome {
     Const(i64),
     Dice {
@@ -476,7 +557,7 @@ impl TermOutcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Outcome {
     pub value: i64,
     pub products: Vec<(AddOp, Vec<TermOutcome>)>,

@@ -1,0 +1,40 @@
+<li class="msg{% if roll.is_some() %} roll{% endif %}" id="msg-{{ seq }}"{% if oob %} hx-swap-oob="outerHTML:#msg-{{ seq }}"{% endif %}>
+  <div class="msg-head">
+    <span class="author">{{ author_name }}</span>
+    <time title="{{ created_fmt }}">{{ created_fmt }}</time>
+    {% if let Some(editor) = edited_by %}<span class="edited">edited by {{ editor }}</span>{% endif %}
+    {% if !locked %}
+    <button class="subtle edit-btn" hx-get="/r/{{ token }}/messages/{{ seq }}/edit"
+            hx-target="#msg-{{ seq }}" hx-swap="outerHTML">edit</button>
+    {% endif %}
+  </div>
+  {% if let Some(roll) = roll %}
+  <div class="roll-body">
+    <span class="roll-expr">&#127922; {{ roll.expr }}</span>
+    <span class="roll-detail">
+      {%- for part in roll.parts -%}
+        {%- if !part.op.is_empty() %}<span class="roll-op">{{ part.op }}</span>{% endif -%}
+        {%- if part.is_const -%}
+          <span class="roll-const">{{ part.value }}</span>
+        {%- else -%}
+          <span class="roll-term" title="{{ part.label }} = {{ part.value }}{% if part.counts_successes %} successes{% endif %}">
+            <span class="term-label">{{ part.label }}</span>
+            <span class="faces">
+              {%- for d in part.dice -%}
+                <span class="die{% if d.dropped %} dropped{% endif %}{% if d.exploded %} exploded{% endif %}{% if d.success %} success{% endif %}"
+                  {%- if d.exploded %} title="exploded"{% endif %}>
+                  {%- for r in d.rerolled %}<s class="rerolled" title="rerolled">{{ r }}</s> {% endfor -%}
+                  {{- d.value }}{% if d.exploded %}!{% endif -%}
+                </span>
+              {%- endfor -%}
+            </span>
+          </span>
+        {%- endif -%}
+      {%- endfor -%}
+    </span>
+    <span class="roll-total">= <b>{{ roll.total }}</b></span>
+  </div>
+  {% else %}
+  <p class="msg-body">{{ body }}</p>
+  {% endif %}
+</li>

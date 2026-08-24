@@ -1,0 +1,12 @@
+<li class="msg editing" id="msg-{{ seq }}">
+  <form hx-post="/r/{{ token }}/messages/{{ seq }}" hx-target="#msg-{{ seq }}" hx-swap="outerHTML">
+    {% if let Some(error) = error %}<p class="error">{{ error }}</p>{% endif %}
+    <div class="composer-row">
+      {% if is_roll %}<span class="roll-prefix" title="Saving re-rolls with fresh dice">/roll</span>{% endif %}
+      <input name="body" value="{{ value }}" maxlength="2000" autocomplete="off" autofocus>
+      <button class="primary">{% if is_roll %}Save &amp; re-roll{% else %}Save{% endif %}</button>
+      <button type="button" class="subtle" hx-get="/r/{{ token }}/messages/{{ seq }}"
+              hx-target="#msg-{{ seq }}" hx-swap="outerHTML">Cancel</button>
+    </div>
+  </form>
+</li>

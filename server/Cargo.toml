@@ -1,0 +1,28 @@
+[package]
+name = "dice-chat"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "One-off chat rooms with integrated dice rolling"
+
+[dependencies]
+dice = { path = "../dice" }
+axum = "0.8"
+axum-extra = { version = "0.10", features = ["cookie-signed"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-core = "0.3"
+askama = "0.14"
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio-postgres = "0.7"
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+base64 = "0.22"
+cookie = "0.18"
+getrandom = "0.3"
+
+[[bin]]
+name = "dice-chat"
+path = "src/main.rs"

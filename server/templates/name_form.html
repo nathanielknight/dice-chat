@@ -1,0 +1,7 @@
+<form id="name-form" class="name-form" hx-post="/r/{{ token }}/name" hx-swap="outerHTML">
+  <label for="name-input">Your name</label>
+  <input id="name-input" name="name" value="{{ name }}" maxlength="50" autocomplete="off"
+         placeholder="Set a display name">
+  <button class="subtle">{% if name.is_empty() %}Join{% else %}Rename{% endif %}</button>
+  {% if saved %}<span class="saved">&#10003;</span>{% endif %}
+</form>

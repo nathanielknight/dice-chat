@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}Dice Chat room{% endblock %}
+
+{% block body %}
+<main class="room" hx-ext="sse" sse-connect="/r/{{ token }}/events?last={{ snapshot_seq }}">
+  <header>
+    <div class="room-title">
+      <h1><a href="/">&#127922;</a> Dice Chat</h1>
+      {% if locked %}
+        <span class="locked-badge" title="No new messages, edits, or rolls">read-only</span>
+      {% else %}
+        <form hx-post="/r/{{ token }}/lock" hx-swap="outerHTML"
+              hx-confirm="Lock this room for everyone? It becomes read-only and cannot be unlocked.">
+          <button class="subtle" title="Make the room read-only">lock</button>
+        </form>
+      {% endif %}
+    </div>
+    {{ name_form|safe }}
+    <div class="room-meta">
+      <span>created {{ created_fmt }}{% if !locked %} &middot; locks {{ locks_at_fmt }}{% endif %}</span>
+      <span>export: <a href="/r/{{ token }}/export.txt">text</a> &middot; <a href="/r/{{ token }}/export.json">JSON</a></span>
+    </div>
+  </header>
+
+  <ul id="messages" sse-swap="msg" hx-swap="beforeend">
+    {% for m in messages %}{{ m|safe }}{% endfor %}
+  </ul>
+  <div sse-swap="refresh" hx-target="#messages" hx-swap="innerHTML" hidden></div>
+  <div sse-swap="locked" hx-target="#composer" hx-swap="outerHTML" hidden></div>
+
+  {{ composer|safe }}
+</main>
+<script>
+  (function () {
+    var list = document.getElementById('messages');
+    list.scrollTop = list.scrollHeight;
+    document.body.addEventListener('htmx:sseMessage', function () {
+      list.scrollTop = list.scrollHeight;
+    });
+  })();
+</script>
+{% endblock %}

@@ -1,0 +1,9 @@
+[package]
+name = "dice"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Dice expression parser and evaluator (SPEC.md §8)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

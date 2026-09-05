@@ -1,0 +1,14 @@
+{% if locked %}
+<div id="composer" class="composer locked-note">
+  This room is locked &mdash; it is read-only. Exports remain available.
+</div>
+{% else %}
+<form id="composer" class="composer" hx-post="/r/{{ token }}/messages" hx-swap="outerHTML">
+  {% if let Some(error) = error %}<p class="error">{{ error }}</p>{% endif %}
+  <div class="composer-row">
+    <input name="body" value="{{ draft }}" maxlength="2000" autocomplete="off" autofocus
+           placeholder="Say something, or /roll 2d6+3">
+    <button class="primary">Send</button>
+  </div>
+</form>
+{% endif %}

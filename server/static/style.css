@@ -140,6 +140,8 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .msg-head .edit-btn { visibility: hidden; margin-left: auto; font-size: 0.8rem; }
 .msg:hover .edit-btn { visibility: visible; }
 .msg-body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* A comment sitting above its roll reads as a label for it. */
+.msg-body + .roll-body { margin-top: 0.25rem; }
 
 /* ------------------------------------------------------------ rolls */
 .roll-body {
@@ -176,8 +178,10 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 /* --------------------------------------------------------- composer */
 .composer { border-top: 1px solid var(--line); padding-top: 0.6rem; }
-.composer-row { display: flex; gap: 0.5rem; align-items: center; }
-.composer-row input { flex: 1; }
-.roll-prefix { color: var(--muted); font-family: monospace; }
+.composer-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+/* The roll is the point of the app, so it leads and keeps a fixed slot;
+   the comment takes whatever room is left. */
+.expr-input { flex: 0 1 12rem; font-family: monospace; }
+.comment-input { flex: 5 1 12rem; min-width: 0; }
 .locked-note { color: var(--muted); text-align: center; }
 .editing form { margin: 0; }

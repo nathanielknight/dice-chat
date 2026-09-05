@@ -34,12 +34,7 @@ pub struct Room {
     pub event_counter: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageKind {
-    Text,
-    Roll,
-}
-
+/// A message carries a roll, a comment, or both (SPEC.md §5).
 #[derive(Debug, Clone)]
 pub struct Message {
     pub room_id: i64,
@@ -47,9 +42,10 @@ pub struct Message {
     pub seq: i64,
     /// Client id of the original author.
     pub author: String,
-    pub kind: MessageKind,
-    /// Text body, or the roll expression as typed.
-    pub body: String,
+    /// The roll expression as typed, when the message has a roll.
+    pub expr: Option<String>,
+    /// Free-text comment; empty when the message is a bare roll.
+    pub comment: String,
     /// For rolls: structured results (`dice::Outcome`) as JSON.
     pub roll_json: Option<String>,
     /// For rolls: the rendered total.
@@ -67,10 +63,28 @@ impl Message {
     pub fn edited(&self) -> bool {
         self.event_seq != self.created_event_seq
     }
+
+    pub fn is_roll(&self) -> bool {
+        self.expr.is_some()
+    }
 }
 
-/// Outcome of a roll attempted inside a store transaction.
-pub type RollAttempt = Result<Message, dice::EvalError>;
+/// A roll to evaluate inside the store transaction: the expression as typed
+/// alongside its parsed form.
+#[derive(Debug, Clone)]
+pub struct RollInput {
+    pub src: String,
+    pub expr: dice::Expr,
+}
+
+impl RollInput {
+    pub fn new(src: &str, expr: &dice::Expr) -> Self {
+        RollInput { src: src.to_owned(), expr: expr.clone() }
+    }
+}
+
+/// Outcome of a write whose roll is evaluated inside the transaction.
+pub type MessageAttempt = Result<Message, dice::EvalError>;
 
 #[async_trait::async_trait]
 pub trait Store: Send + Sync {
@@ -99,46 +113,30 @@ pub trait Store: Send + Sync {
     /// The room's client id → display name mapping.
     async fn names(&self, room_id: i64) -> StoreResult<HashMap<String, String>>;
 
-    async fn post_text(
+    /// Append a message. When `roll` is present it is evaluated with the
+    /// room's RNG, whose state advances in the same transaction; an eval
+    /// error rolls everything back and persists nothing.
+    async fn post_message(
         &self,
         room_id: i64,
         author: &str,
-        body: &str,
+        roll: Option<RollInput>,
+        comment: &str,
         now: i64,
-    ) -> StoreResult<Message>;
+    ) -> StoreResult<MessageAttempt>;
 
-    /// Roll `expr` with the room's RNG and append the result; RNG state
-    /// advances in the same transaction. An eval error rolls everything back.
-    async fn post_roll(
-        &self,
-        room_id: i64,
-        author: &str,
-        expr_src: &str,
-        expr: &dice::Expr,
-        now: i64,
-    ) -> StoreResult<RollAttempt>;
-
-    /// Replace a text message's body. `None` if no such text message.
-    async fn edit_text(
+    /// Replace a message's roll and comment. A roll is re-evaluated with
+    /// fresh randomness, whatever the message held before, so an edit can
+    /// add, change, or drop a roll. `None` if no such message.
+    async fn edit_message(
         &self,
         room_id: i64,
         seq: i64,
         editor: &str,
-        body: &str,
+        roll: Option<RollInput>,
+        comment: &str,
         now: i64,
-    ) -> StoreResult<Option<Message>>;
-
-    /// Re-roll a roll message with a (possibly new) expression, drawing fresh
-    /// randomness from the room RNG. `None` if no such roll message.
-    async fn edit_roll(
-        &self,
-        room_id: i64,
-        seq: i64,
-        editor: &str,
-        expr_src: &str,
-        expr: &dice::Expr,
-        now: i64,
-    ) -> StoreResult<Option<RollAttempt>>;
+    ) -> StoreResult<Option<MessageAttempt>>;
 
     async fn get_message(&self, room_id: i64, seq: i64) -> StoreResult<Option<Message>>;
 

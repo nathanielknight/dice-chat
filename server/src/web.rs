@@ -18,7 +18,7 @@ use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
 
 use crate::clock::{self, format_utc, LOCK_AFTER};
-use crate::store::{Message, MessageKind, Room, Store, StoreError};
+use crate::store::{Message, RollInput, Room, Store, StoreError};
 use crate::token::{new_client_id, new_token};
 use crate::view::{display_name, Composer, EditForm, IndexPage, MessageView, NameForm, RoomPage};
 
@@ -281,45 +281,62 @@ async fn set_name(
 
 // -------------------------------------------------------------- messages
 
+/// The composer (and the edit form) post a roll expression and a comment;
+/// either may be blank, but not both.
 #[derive(Deserialize)]
-struct BodyInput {
-    body: String,
+struct MessageInput {
+    #[serde(default)]
+    expr: String,
+    #[serde(default)]
+    comment: String,
+}
+
+impl MessageInput {
+    /// Trimmed `(expr, comment)`.
+    fn trimmed(&self) -> (&str, &str) {
+        (self.expr.trim(), self.comment.trim())
+    }
+}
+
+/// Parse a roll expression, if there is one, into what the store evaluates.
+fn parse_roll(expr: &str) -> Result<Option<RollInput>, String> {
+    if expr.is_empty() {
+        return Ok(None);
+    }
+    match dice::parse(expr) {
+        Ok(parsed) => Ok(Some(RollInput::new(expr, &parsed))),
+        Err(e) => Err(format!("{e}")),
+    }
 }
 
 async fn post_message(
     State(app): State<AppState>,
     Extension(ClientId(cid)): Extension<ClientId>,
     Path(token): Path<String>,
-    Form(input): Form<BodyInput>,
+    Form(input): Form<MessageInput>,
 ) -> Result<Response, Response> {
     let room = find_room(&app, &token).await?;
     let now = clock::now();
     if room_locked(&room, now) {
         return Ok(html(&Composer::fresh(&token, true)).into_response());
     }
-    let body = input.body.trim();
-    if body.is_empty() {
+    let (expr, comment) = input.trimmed();
+    if expr.is_empty() && comment.is_empty() {
         return Ok(html(&Composer::fresh(&token, false)).into_response());
     }
 
-    let msg = if let Some(expr_src) = roll_command(body) {
-        let expr = match dice::parse(expr_src) {
-            Ok(expr) => expr,
-            Err(e) => {
-                let err = format!("{e}");
-                return Ok(composer_error(&token, err, body).into_response());
-            }
-        };
-        match app.store.post_roll(room.id, &cid, expr_src, &expr, now).await.map_err(internal)? {
-            Ok(msg) => msg,
-            Err(e) => return Ok(composer_error(&token, format!("{e}"), body).into_response()),
-        }
-    } else if body.starts_with("/") && !body.starts_with("//") {
-        let err = "unknown command — only /roll is supported (start with // to send a literal slash)";
-        return Ok(composer_error(&token, err.into(), body).into_response());
-    } else {
-        let body = body.strip_prefix("//").map(|rest| format!("/{rest}")).unwrap_or_else(|| body.to_string());
-        app.store.post_text(room.id, &cid, &body, now).await.map_err(internal)?
+    let roll = match parse_roll(expr) {
+        Ok(roll) => roll,
+        Err(e) => return Ok(composer_error(&token, e, expr, comment).into_response()),
+    };
+    let msg = match app
+        .store
+        .post_message(room.id, &cid, roll, comment, now)
+        .await
+        .map_err(internal)?
+    {
+        Ok(msg) => msg,
+        Err(e) => return Ok(composer_error(&token, format!("{e}"), expr, comment).into_response()),
     };
 
     let names = app.store.names(room.id).await.map_err(internal)?;
@@ -328,17 +345,8 @@ async fn post_message(
     Ok(html(&Composer::fresh(&token, false)).into_response())
 }
 
-/// `/roll <expr>` → the expression; anything else → None.
-fn roll_command(body: &str) -> Option<&str> {
-    let rest = body.strip_prefix("/roll")?;
-    if rest.is_empty() {
-        return Some(""); // yields a parse error with a helpful position
-    }
-    rest.starts_with(char::is_whitespace).then(|| rest.trim())
-}
-
-fn composer_error(token: &str, error: String, draft: &str) -> Html<String> {
-    html(&Composer::with_error(token, error, draft.to_string()))
+fn composer_error(token: &str, error: String, expr: &str, comment: &str) -> Html<String> {
+    html(&Composer::with_error(token, error, expr, comment))
 }
 
 async fn message_fragment(
@@ -370,8 +378,8 @@ async fn edit_form(
     let form = EditForm {
         token,
         seq,
-        is_roll: msg.kind == MessageKind::Roll,
-        value: msg.body.clone(),
+        expr: msg.expr.clone().unwrap_or_default(),
+        comment: msg.comment.clone(),
         error: None,
     };
     Ok(html(&form).into_response())
@@ -381,7 +389,7 @@ async fn edit_message(
     State(app): State<AppState>,
     Extension(ClientId(cid)): Extension<ClientId>,
     Path((token, seq)): Path<(String, i64)>,
-    Form(input): Form<BodyInput>,
+    Form(input): Form<MessageInput>,
 ) -> Result<Response, Response> {
     let room = find_room(&app, &token).await?;
     let now = clock::now();
@@ -393,37 +401,35 @@ async fn edit_message(
         return Ok(Html(render_message(&existing, &token, &names, true, false)).into_response());
     }
 
-    let is_roll = existing.kind == MessageKind::Roll;
-    let value = input.body.trim().to_string();
+    let (expr, comment) = input.trimmed();
     let edit_error = |error: String| {
-        html(&EditForm { token: token.clone(), seq, is_roll, value: value.clone(), error: Some(error) })
-            .into_response()
+        html(&EditForm {
+            token: token.clone(),
+            seq,
+            expr: expr.to_string(),
+            comment: comment.to_string(),
+            error: Some(error),
+        })
+        .into_response()
+    };
+    if expr.is_empty() && comment.is_empty() {
+        return Ok(edit_error("a message needs a roll or a comment".into()));
+    }
+    let roll = match parse_roll(expr) {
+        Ok(roll) => roll,
+        Err(e) => return Ok(edit_error(e)),
     };
 
-    let msg = if is_roll {
-        // Editing a roll re-rolls it with fresh randomness (SPEC.md §5).
-        let expr = match dice::parse(&value) {
-            Ok(expr) => expr,
-            Err(e) => return Ok(edit_error(format!("{e}"))),
-        };
-        match app
-            .store
-            .edit_roll(room.id, seq, &cid, &value, &expr, now)
-            .await
-            .map_err(internal)?
-        {
-            Some(Ok(msg)) => msg,
-            Some(Err(e)) => return Ok(edit_error(format!("{e}"))),
-            None => return Err((StatusCode::NOT_FOUND, "no such message").into_response()),
-        }
-    } else {
-        if value.is_empty() {
-            return Ok(edit_error("a message needs some text".into()));
-        }
-        match app.store.edit_text(room.id, seq, &cid, &value, now).await.map_err(internal)? {
-            Some(msg) => msg,
-            None => return Err((StatusCode::NOT_FOUND, "no such message").into_response()),
-        }
+    // Editing a roll re-rolls it with fresh randomness (SPEC.md §5).
+    let msg = match app
+        .store
+        .edit_message(room.id, seq, &cid, roll, comment, now)
+        .await
+        .map_err(internal)?
+    {
+        Some(Ok(msg)) => msg,
+        Some(Err(e)) => return Ok(edit_error(format!("{e}"))),
+        None => return Err((StatusCode::NOT_FOUND, "no such message").into_response()),
     };
 
     // Everyone else gets the edit as an out-of-band swap; the editor gets it
@@ -537,8 +543,9 @@ struct ExportMessage<'a> {
     seq: i64,
     author: &'a str,
     author_name: String,
-    kind: &'static str,
-    body: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expr: Option<&'a str>,
+    comment: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -567,11 +574,8 @@ async fn export_json(
                 seq: m.seq,
                 author: &m.author,
                 author_name: display_name(&names, &m.author),
-                kind: match m.kind {
-                    MessageKind::Text => "text",
-                    MessageKind::Roll => "roll",
-                },
-                body: &m.body,
+                expr: m.expr.as_deref(),
+                comment: &m.comment,
                 total: m.total,
                 roll: m.roll_json.as_deref().and_then(|j| serde_json::from_str(j).ok()),
                 created_at: m.created_at,
@@ -601,11 +605,9 @@ async fn export_txt(
     for m in &messages {
         let who = display_name(&names, &m.author);
         let when = format_utc(m.created_at);
-        match m.kind {
-            MessageKind::Text => {
-                out.push_str(&format!("[{when}] {who}: {}", m.body));
-            }
-            MessageKind::Roll => {
+        match &m.expr {
+            None => out.push_str(&format!("[{when}] {who}: {}", m.comment)),
+            Some(expr) => {
                 let faces = m
                     .roll_json
                     .as_deref()
@@ -613,10 +615,12 @@ async fn export_txt(
                     .map(|o| outcome_txt(&o))
                     .unwrap_or_default();
                 out.push_str(&format!(
-                    "[{when}] {who} rolled {}:{faces} = {}",
-                    m.body,
+                    "[{when}] {who} rolled {expr}:{faces} = {}",
                     m.total.unwrap_or(0)
                 ));
+                if !m.comment.is_empty() {
+                    out.push_str(&format!(" — {}", m.comment));
+                }
             }
         }
         if m.edited() {

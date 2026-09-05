@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior};
 
-use super::{eval_with_state, Message, MessageKind, Room, RollAttempt, Store, StoreError, StoreResult};
+use super::{
+    eval_with_state, Message, MessageAttempt, Room, RollInput, Store, StoreError, StoreResult,
+};
 
 impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
@@ -45,8 +47,8 @@ CREATE TABLE IF NOT EXISTS messages (
     room_id           INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     seq               INTEGER NOT NULL,
     author            TEXT NOT NULL,
-    kind              TEXT NOT NULL CHECK (kind IN ('text', 'roll')),
-    body              TEXT NOT NULL,
+    expr              TEXT,
+    comment           TEXT NOT NULL,
     roll_json         TEXT,
     total             INTEGER,
     created_at        INTEGER NOT NULL,
@@ -66,6 +68,7 @@ impl SqliteStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(SqliteStore { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -84,6 +87,30 @@ impl SqliteStore {
     }
 }
 
+/// Bring a pre-`expr`/`comment` database (messages as `kind` + `body`)
+/// forward: rolls keep their expression, text messages become comments.
+fn migrate(conn: &Connection) -> StoreResult<()> {
+    let legacy: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'kind'",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy == 0 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN;
+         ALTER TABLE messages ADD COLUMN expr TEXT;
+         ALTER TABLE messages ADD COLUMN comment TEXT NOT NULL DEFAULT '';
+         UPDATE messages SET expr = body WHERE kind = 'roll';
+         UPDATE messages SET comment = body WHERE kind = 'text';
+         ALTER TABLE messages DROP COLUMN kind;
+         ALTER TABLE messages DROP COLUMN body;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 fn room_from_row(row: &Row<'_>) -> rusqlite::Result<Room> {
     Ok(Room {
         id: row.get(0)?,
@@ -95,13 +122,12 @@ fn room_from_row(row: &Row<'_>) -> rusqlite::Result<Room> {
 }
 
 fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
-    let kind: String = row.get(3)?;
     Ok(Message {
         room_id: row.get(0)?,
         seq: row.get(1)?,
         author: row.get(2)?,
-        kind: if kind == "roll" { MessageKind::Roll } else { MessageKind::Text },
-        body: row.get(4)?,
+        expr: row.get(3)?,
+        comment: row.get(4)?,
         roll_json: row.get(5)?,
         total: row.get(6)?,
         created_at: row.get(7)?,
@@ -112,8 +138,35 @@ fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
-const MESSAGE_COLS: &str = "room_id, seq, author, kind, body, roll_json, total, \
+const MESSAGE_COLS: &str = "room_id, seq, author, expr, comment, roll_json, total, \
      created_at, updated_at, updated_by, created_event_seq, event_seq";
+
+/// Evaluate a message's roll (if any) against the room's RNG, returning the
+/// columns to write and the successor RNG state. `Ok(Err(_))` is an eval
+/// error: the caller drops the transaction, persisting nothing.
+type RollColumns = (Option<String>, Option<i64>, Option<[u8; crate::rng::STATE_LEN]>);
+
+fn eval_roll(
+    conn: &Connection,
+    room_id: i64,
+    roll: &Option<RollInput>,
+) -> StoreResult<Result<RollColumns, dice::EvalError>> {
+    let Some(roll) = roll else {
+        return Ok(Ok((None, None, None)));
+    };
+    let state: Vec<u8> = conn.query_row(
+        "SELECT rng_state FROM rooms WHERE id = ?1",
+        [room_id],
+        |row| row.get(0),
+    )?;
+    let (outcome, next_state) = match eval_with_state(&state, &roll.expr)? {
+        Ok(ok) => ok,
+        Err(e) => return Ok(Err(e)),
+    };
+    let roll_json = serde_json::to_string(&outcome)
+        .map_err(|e| StoreError(format!("serialize outcome: {e}")))?;
+    Ok(Ok((Some(roll_json), Some(outcome.value), Some(next_state))))
+}
 
 /// Bump the room's counters, returning `(next_seq, next_event_seq)`.
 fn bump_counters(
@@ -218,57 +271,43 @@ impl Store for SqliteStore {
         .await
     }
 
-    async fn post_text(&self, room_id: i64, author: &str, body: &str, now: i64) -> StoreResult<Message> {
-        let (author, body) = (author.to_owned(), body.to_owned());
-        self.call(move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let (seq, event_seq) = bump_counters(&tx, room_id, true)?;
-            tx.execute(
-                "INSERT INTO messages (room_id, seq, author, kind, body,
-                     created_at, updated_at, updated_by, created_event_seq, event_seq)
-                 VALUES (?1, ?2, ?3, 'text', ?4, ?5, ?5, ?3, ?6, ?6)",
-                (room_id, seq, &author, &body, now, event_seq),
-            )?;
-            let msg = get_message_tx(&tx, room_id, seq)?
-                .ok_or_else(|| StoreError("inserted message vanished".into()))?;
-            tx.commit()?;
-            Ok(msg)
-        })
-        .await
-    }
-
-    async fn post_roll(
+    async fn post_message(
         &self,
         room_id: i64,
         author: &str,
-        expr_src: &str,
-        expr: &dice::Expr,
+        roll: Option<RollInput>,
+        comment: &str,
         now: i64,
-    ) -> StoreResult<RollAttempt> {
-        let (author, expr_src, expr) = (author.to_owned(), expr_src.to_owned(), expr.clone());
+    ) -> StoreResult<MessageAttempt> {
+        let (author, comment) = (author.to_owned(), comment.to_owned());
         self.call(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let state: Vec<u8> = tx.query_row(
-                "SELECT rng_state FROM rooms WHERE id = ?1",
-                [room_id],
-                |row| row.get(0),
-            )?;
-            let (outcome, next_state) = match eval_with_state(&state, &expr)? {
-                Ok(ok) => ok,
+            let (roll_json, total, next_state) = match eval_roll(&tx, room_id, &roll)? {
+                Ok(cols) => cols,
                 Err(e) => return Ok(Err(e)), // tx dropped → rollback
             };
-            let roll_json = serde_json::to_string(&outcome)
-                .map_err(|e| StoreError(format!("serialize outcome: {e}")))?;
             let (seq, event_seq) = bump_counters(&tx, room_id, true)?;
+            if let Some(next_state) = next_state {
+                tx.execute(
+                    "UPDATE rooms SET rng_state = ?1 WHERE id = ?2",
+                    (&next_state[..], room_id),
+                )?;
+            }
             tx.execute(
-                "UPDATE rooms SET rng_state = ?1 WHERE id = ?2",
-                (&next_state[..], room_id),
-            )?;
-            tx.execute(
-                "INSERT INTO messages (room_id, seq, author, kind, body, roll_json, total,
+                "INSERT INTO messages (room_id, seq, author, expr, comment, roll_json, total,
                      created_at, updated_at, updated_by, created_event_seq, event_seq)
-                 VALUES (?1, ?2, ?3, 'roll', ?4, ?5, ?6, ?7, ?7, ?3, ?8, ?8)",
-                (room_id, seq, &author, &expr_src, &roll_json, outcome.value, now, event_seq),
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?3, ?9, ?9)",
+                (
+                    room_id,
+                    seq,
+                    &author,
+                    roll.as_ref().map(|r| &r.src),
+                    &comment,
+                    &roll_json,
+                    total,
+                    now,
+                    event_seq,
+                ),
             )?;
             let msg = get_message_tx(&tx, room_id, seq)?
                 .ok_or_else(|| StoreError("inserted message vanished".into()))?;
@@ -278,75 +317,48 @@ impl Store for SqliteStore {
         .await
     }
 
-    async fn edit_text(
+    async fn edit_message(
         &self,
         room_id: i64,
         seq: i64,
         editor: &str,
-        body: &str,
+        roll: Option<RollInput>,
+        comment: &str,
         now: i64,
-    ) -> StoreResult<Option<Message>> {
-        let (editor, body) = (editor.to_owned(), body.to_owned());
+    ) -> StoreResult<Option<MessageAttempt>> {
+        let (editor, comment) = (editor.to_owned(), comment.to_owned());
         self.call(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let Some(existing) = get_message_tx(&tx, room_id, seq)? else {
-                return Ok(None);
-            };
-            if existing.kind != MessageKind::Text {
+            if get_message_tx(&tx, room_id, seq)?.is_none() {
                 return Ok(None);
             }
-            let (_, event_seq) = bump_counters(&tx, room_id, false)?;
-            tx.execute(
-                "UPDATE messages SET body = ?1, updated_at = ?2, updated_by = ?3, event_seq = ?4
-                 WHERE room_id = ?5 AND seq = ?6",
-                (&body, now, &editor, event_seq, room_id, seq),
-            )?;
-            let msg = get_message_tx(&tx, room_id, seq)?;
-            tx.commit()?;
-            Ok(msg)
-        })
-        .await
-    }
-
-    async fn edit_roll(
-        &self,
-        room_id: i64,
-        seq: i64,
-        editor: &str,
-        expr_src: &str,
-        expr: &dice::Expr,
-        now: i64,
-    ) -> StoreResult<Option<RollAttempt>> {
-        let (editor, expr_src, expr) = (editor.to_owned(), expr_src.to_owned(), expr.clone());
-        self.call(move |conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let Some(existing) = get_message_tx(&tx, room_id, seq)? else {
-                return Ok(None);
-            };
-            if existing.kind != MessageKind::Roll {
-                return Ok(None);
-            }
-            let state: Vec<u8> = tx.query_row(
-                "SELECT rng_state FROM rooms WHERE id = ?1",
-                [room_id],
-                |row| row.get(0),
-            )?;
-            let (outcome, next_state) = match eval_with_state(&state, &expr)? {
-                Ok(ok) => ok,
+            // Editing a roll re-rolls it with fresh randomness (SPEC.md §5).
+            let (roll_json, total, next_state) = match eval_roll(&tx, room_id, &roll)? {
+                Ok(cols) => cols,
                 Err(e) => return Ok(Some(Err(e))),
             };
-            let roll_json = serde_json::to_string(&outcome)
-                .map_err(|e| StoreError(format!("serialize outcome: {e}")))?;
             let (_, event_seq) = bump_counters(&tx, room_id, false)?;
+            if let Some(next_state) = next_state {
+                tx.execute(
+                    "UPDATE rooms SET rng_state = ?1 WHERE id = ?2",
+                    (&next_state[..], room_id),
+                )?;
+            }
             tx.execute(
-                "UPDATE rooms SET rng_state = ?1 WHERE id = ?2",
-                (&next_state[..], room_id),
-            )?;
-            tx.execute(
-                "UPDATE messages SET body = ?1, roll_json = ?2, total = ?3,
-                     updated_at = ?4, updated_by = ?5, event_seq = ?6
-                 WHERE room_id = ?7 AND seq = ?8",
-                (&expr_src, &roll_json, outcome.value, now, &editor, event_seq, room_id, seq),
+                "UPDATE messages SET expr = ?1, comment = ?2, roll_json = ?3, total = ?4,
+                     updated_at = ?5, updated_by = ?6, event_seq = ?7
+                 WHERE room_id = ?8 AND seq = ?9",
+                (
+                    roll.as_ref().map(|r| &r.src),
+                    &comment,
+                    &roll_json,
+                    total,
+                    now,
+                    &editor,
+                    event_seq,
+                    room_id,
+                    seq,
+                ),
             )?;
             let msg = get_message_tx(&tx, room_id, seq)?
                 .ok_or_else(|| StoreError("edited message vanished".into()))?;

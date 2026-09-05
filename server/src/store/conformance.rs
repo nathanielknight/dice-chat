@@ -17,12 +17,26 @@ async fn mk_room(store: &dyn Store, now: i64) -> Room {
         .expect("create_room")
 }
 
+fn roll(src: &str) -> RollInput {
+    RollInput::new(src, &dice::parse(src).expect("parse"))
+}
+
+/// Post a comment-only message.
+async fn post_comment(store: &dyn Store, room_id: i64, author: &str, comment: &str, now: i64) -> Message {
+    store
+        .post_message(room_id, author, None, comment, now)
+        .await
+        .expect("store")
+        .expect("no roll to fail")
+}
+
 pub async fn run(store: &dyn Store) {
     rooms_and_tokens(store).await;
     names(store).await;
-    text_messages_and_edits(store).await;
+    comments_and_edits(store).await;
     rolls_advance_rng_in_transaction(store).await;
     roll_edit_rerolls(store).await;
+    rolls_carry_comments(store).await;
     failed_roll_persists_nothing(store).await;
     locking(store).await;
     sweep(store).await;
@@ -64,14 +78,15 @@ async fn names(store: &dyn Store) {
     assert_eq!(store.names(other.id).await.unwrap()["client-a"], "Someone Else");
 }
 
-async fn text_messages_and_edits(store: &dyn Store) {
+async fn comments_and_edits(store: &dyn Store) {
     let room = mk_room(store, 1000).await;
 
-    let m1 = store.post_text(room.id, "client-a", "hello", 1001).await.unwrap();
-    let m2 = store.post_text(room.id, "client-b", "hi back", 1002).await.unwrap();
+    let m1 = post_comment(store, room.id, "client-a", "hello", 1001).await;
+    let m2 = post_comment(store, room.id, "client-b", "hi back", 1002).await;
     assert_eq!((m1.seq, m2.seq), (1, 2));
-    assert_eq!(m1.kind, MessageKind::Text);
-    assert_eq!(m1.body, "hello");
+    assert!(!m1.is_roll());
+    assert_eq!(m1.comment, "hello");
+    assert_eq!(m1.total, None);
     assert_eq!(m1.author, "client-a");
     assert_eq!(m1.updated_by, "client-a");
     assert_eq!((m1.created_at, m1.updated_at), (1001, 1001));
@@ -80,11 +95,12 @@ async fn text_messages_and_edits(store: &dyn Store) {
 
     // Anyone in the room may edit any message.
     let edited = store
-        .edit_text(room.id, m1.seq, "client-b", "hello (fixed)", 1003)
+        .edit_message(room.id, m1.seq, "client-b", None, "hello (fixed)", 1003)
         .await
         .unwrap()
-        .expect("message exists");
-    assert_eq!(edited.body, "hello (fixed)");
+        .expect("message exists")
+        .expect("no roll to fail");
+    assert_eq!(edited.comment, "hello (fixed)");
     assert_eq!(edited.author, "client-a"); // author unchanged
     assert_eq!(edited.updated_by, "client-b");
     assert_eq!(edited.created_at, 1001);
@@ -92,48 +108,50 @@ async fn text_messages_and_edits(store: &dyn Store) {
     assert!(edited.edited());
     assert!(edited.event_seq > m2.event_seq);
 
-    // Listing returns seq order with current bodies.
+    // Listing returns seq order with current comments.
     let all = store.list_messages(room.id).await.unwrap();
     assert_eq!(all.len(), 2);
-    assert_eq!(all[0].body, "hello (fixed)");
-    assert_eq!(all[1].body, "hi back");
+    assert_eq!(all[0].comment, "hello (fixed)");
+    assert_eq!(all[1].comment, "hi back");
 
     // get_message round-trips; absent seq is None.
     let got = store.get_message(room.id, m2.seq).await.unwrap().unwrap();
-    assert_eq!(got.body, "hi back");
+    assert_eq!(got.comment, "hi back");
     assert!(store.get_message(room.id, 999).await.unwrap().is_none());
 
-    // Editing a text message as a roll (or vice versa) is refused.
-    let expr = dice::parse("d6").unwrap();
-    assert!(store
-        .edit_roll(room.id, m1.seq, "client-a", "d6", &expr, 1004)
+    // An edit can attach a roll to a message that had none.
+    let now_a_roll = store
+        .edit_message(room.id, m1.seq, "client-a", Some(roll("d6")), "hello (fixed)", 1004)
         .await
         .unwrap()
-        .is_none());
+        .expect("message exists")
+        .expect("eval ok");
+    assert_eq!(now_a_roll.expr.as_deref(), Some("d6"));
+    assert_eq!(now_a_roll.comment, "hello (fixed)");
+    assert!((1..=6).contains(&now_a_roll.total.unwrap()));
 }
 
 async fn rolls_advance_rng_in_transaction(store: &dyn Store) {
     let room = mk_room(store, 1000).await;
-    let expr = dice::parse("4d6kh3+2").unwrap();
 
     let m = store
-        .post_roll(room.id, "client-a", "4d6kh3+2", &expr, 1001)
+        .post_message(room.id, "client-a", Some(roll("4d6kh3+2")), "", 1001)
         .await
         .unwrap()
         .expect("eval ok");
-    assert_eq!(m.kind, MessageKind::Roll);
-    assert_eq!(m.body, "4d6kh3+2");
+    assert!(m.is_roll());
+    assert_eq!(m.expr.as_deref(), Some("4d6kh3+2"));
+    assert_eq!(m.comment, "");
     let outcome: dice::Outcome = serde_json::from_str(m.roll_json.as_deref().unwrap()).unwrap();
     assert_eq!(Some(outcome.value), m.total);
     let total = m.total.unwrap();
     assert!((5..=20).contains(&total), "4d6kh3+2 out of range: {total}");
 
     // Successive rolls draw fresh randomness: 100 d20 rolls can't all match.
-    let expr = dice::parse("d20").unwrap();
     let mut totals = std::collections::HashSet::new();
     for i in 0..100 {
         let m = store
-            .post_roll(room.id, "client-a", "d20", &expr, 1002 + i)
+            .post_message(room.id, "client-a", Some(roll("d20")), "", 1002 + i)
             .await
             .unwrap()
             .unwrap();
@@ -146,23 +164,21 @@ async fn rolls_advance_rng_in_transaction(store: &dyn Store) {
 
 async fn roll_edit_rerolls(store: &dyn Store) {
     let room = mk_room(store, 1000).await;
-    let expr = dice::parse("d6").unwrap();
     let m = store
-        .post_roll(room.id, "client-a", "d6", &expr, 1001)
+        .post_message(room.id, "client-a", Some(roll("d6")), "", 1001)
         .await
         .unwrap()
         .unwrap();
 
     // Editing a roll re-rolls it — possibly with a different expression.
-    let expr2 = dice::parse("2d20+100").unwrap();
     let edited = store
-        .edit_roll(room.id, m.seq, "client-b", "2d20+100", &expr2, 1002)
+        .edit_message(room.id, m.seq, "client-b", Some(roll("2d20+100")), "", 1002)
         .await
         .unwrap()
         .expect("roll exists")
         .expect("eval ok");
     assert_eq!(edited.seq, m.seq);
-    assert_eq!(edited.body, "2d20+100");
+    assert_eq!(edited.expr.as_deref(), Some("2d20+100"));
     assert_eq!(edited.updated_by, "client-b");
     assert!(edited.edited());
     let t = edited.total.unwrap();
@@ -170,29 +186,59 @@ async fn roll_edit_rerolls(store: &dyn Store) {
     // Prior results are replaced, not kept.
     let stored = store.get_message(room.id, m.seq).await.unwrap().unwrap();
     assert_eq!(stored.total, edited.total);
-    assert_eq!(stored.body, "2d20+100");
+    assert_eq!(stored.expr.as_deref(), Some("2d20+100"));
 
-    // Editing a roll as text is refused.
-    assert!(store
-        .edit_text(room.id, m.seq, "client-a", "not a roll", 1003)
+    // An edit can drop the roll, leaving a comment-only message.
+    let dropped = store
+        .edit_message(room.id, m.seq, "client-a", None, "never mind", 1003)
         .await
         .unwrap()
-        .is_none());
+        .expect("message exists")
+        .expect("no roll to fail");
+    assert!(!dropped.is_roll());
+    assert_eq!(dropped.comment, "never mind");
+    assert_eq!(dropped.total, None);
+    assert!(dropped.roll_json.is_none());
 
     // Editing a nonexistent message is None.
     assert!(store
-        .edit_roll(room.id, 999, "client-a", "d6", &expr, 1004)
+        .edit_message(room.id, 999, "client-a", Some(roll("d6")), "", 1004)
         .await
         .unwrap()
         .is_none());
 }
 
+/// A message can be a roll, a comment, or both (SPEC.md §5).
+async fn rolls_carry_comments(store: &dyn Store) {
+    let room = mk_room(store, 1000).await;
+    let m = store
+        .post_message(room.id, "client-a", Some(roll("d20adv+4")), "Attack", 1001)
+        .await
+        .unwrap()
+        .expect("eval ok");
+    assert_eq!(m.expr.as_deref(), Some("d20adv+4"));
+    assert_eq!(m.comment, "Attack");
+    assert!((5..=24).contains(&m.total.unwrap()));
+
+    // The comment survives a re-roll, and can be edited on its own.
+    let edited = store
+        .edit_message(room.id, m.seq, "client-a", Some(roll("d20dis+4")), "Attack (with cover)", 1002)
+        .await
+        .unwrap()
+        .expect("message exists")
+        .expect("eval ok");
+    assert_eq!(edited.expr.as_deref(), Some("d20dis+4"));
+    assert_eq!(edited.comment, "Attack (with cover)");
+
+    let all = store.list_messages(room.id).await.unwrap();
+    assert_eq!(all.len(), 1);
+}
+
 async fn failed_roll_persists_nothing(store: &dyn Store) {
     let room = mk_room(store, 1000).await;
     // d6r6 parses but can never terminate → eval error inside the tx.
-    let expr = dice::parse("d6r6").unwrap();
     let attempt = store
-        .post_roll(room.id, "client-a", "d6r6", &expr, 1001)
+        .post_message(room.id, "client-a", Some(roll("d6r6")), "here goes", 1001)
         .await
         .unwrap();
     assert_eq!(attempt.unwrap_err(), dice::EvalError::RerollUnsatisfiable);
@@ -200,7 +246,7 @@ async fn failed_roll_persists_nothing(store: &dyn Store) {
     // Nothing persisted: no message, no seq consumed, no event.
     assert!(store.list_messages(room.id).await.unwrap().is_empty());
     let ok = store
-        .post_roll(room.id, "client-a", "d6", &dice::parse("d6").unwrap(), 1002)
+        .post_message(room.id, "client-a", Some(roll("d6")), "", 1002)
         .await
         .unwrap()
         .unwrap();
@@ -212,7 +258,7 @@ async fn failed_roll_persists_nothing(store: &dyn Store) {
 
 async fn locking(store: &dyn Store) {
     let room = mk_room(store, 1000).await;
-    store.post_text(room.id, "client-a", "hi", 1001).await.unwrap();
+    post_comment(store, room.id, "client-a", "hi", 1001).await;
 
     let before = store.room_by_token(&room.token).await.unwrap().unwrap();
     let event_seq = store.lock_room(room.id, 2000).await.unwrap();
@@ -234,7 +280,7 @@ async fn locking(store: &dyn Store) {
 async fn sweep(store: &dyn Store) {
     let old = mk_room(store, 100).await;
     let new = mk_room(store, 5000).await;
-    store.post_text(old.id, "client-a", "doomed", 101).await.unwrap();
+    post_comment(store, old.id, "client-a", "doomed", 101).await;
     store.set_name(old.id, "client-a", "Ghost", 101).await.unwrap();
 
     let n = store.sweep(1000).await.unwrap();

@@ -22,12 +22,17 @@ Configuration is via environment variables:
 | `BIND_ADDR`    | `127.0.0.1:8080`      | listen address |
 
 The storage backend is selected by the connection string; the schema is
-created automatically on first start.
+created automatically on first start. A database written by a version that
+still used `/roll` is migrated in place on startup: old text messages become
+comments, old rolls keep their expressions.
 
-## Dice notation
+## Rolling
 
-Post `/roll <expression>` in a room. The notation (SPEC.md §8) is a subset
-of the de facto Roll20 conventions:
+A room's composer has two inputs: one for a dice roll, one for a comment.
+Fill in either or both — a bare roll, a line of chat, or a roll with a note
+attached ("Attack" + `d20adv + 4`). Rolling needs no command or prefix.
+
+The notation (SPEC.md §8) is a subset of the de facto Roll20 conventions:
 
 - `2d6+3`, `1d8 + 1d6 + 2`, `2d6*3` — arithmetic (`*` binds tighter)
 - `d20adv` / `d20dis` — advantage / disadvantage
@@ -36,12 +41,12 @@ of the de facto Roll20 conventions:
 - `8d10>=7` — count successes (`>` and `<` are strict)
 - `dF` — Fate dice, `d%` — percentile
 
-In the composer, Up/Down arrows scroll back through your recent rolls
-(shell-style; kept per browser, per room).
+In the composer's roll box, Up/Down arrows scroll back through your recent
+rolls (shell-style; kept per browser, per room).
 
-Editing a text message replaces its body; editing a roll **re-rolls it**
-with fresh randomness. Anyone in the room can edit any message — it's a
-casual-play trust model.
+Editing a message replaces its comment and **re-rolls** any roll it has with
+fresh randomness; an edit can also add a roll to a comment, or drop one.
+Anyone in the room can edit any message — it's a casual-play trust model.
 
 ## Development
 

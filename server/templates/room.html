@@ -39,5 +39,60 @@
       list.scrollTop = list.scrollHeight;
     });
   })();
+
+  // Roll scrollback: Up/Down arrows in the composer recall this browser's
+  // recent /roll commands, shell-style. Listeners are delegated to the body
+  // because htmx replaces the composer after every post.
+  (function () {
+    var LIMIT = 50;
+    var key = 'dice-chat:roll-history:{{ token }}';
+    function load() {
+      try {
+        var h = JSON.parse(localStorage.getItem(key));
+        return Array.isArray(h) ? h : [];
+      } catch (e) { return []; }
+    }
+    function save(h) {
+      try { localStorage.setItem(key, JSON.stringify(h)); } catch (e) {}
+    }
+    var history = load();
+    var idx = history.length;  // one past the newest entry = "live draft"
+    var draft = '';
+
+    function isComposerInput(el) {
+      return el && el.name === 'body' && el.form && el.form.id === 'composer';
+    }
+
+    document.body.addEventListener('htmx:configRequest', function (ev) {
+      if (ev.detail.elt.id !== 'composer') return;
+      var body = (ev.detail.parameters.body || '').trim();
+      if (/^\/roll(\s|$)/.test(body)) {
+        history = load();  // merge with other tabs
+        if (history[history.length - 1] !== body) history.push(body);
+        if (history.length > LIMIT) history = history.slice(-LIMIT);
+        save(history);
+      }
+      idx = history.length;
+      draft = '';
+    });
+
+    document.body.addEventListener('keydown', function (ev) {
+      if (!isComposerInput(ev.target)) return;
+      if (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown') return;
+      var input = ev.target;
+      if (ev.key === 'ArrowUp') {
+        if (idx === 0) return;
+        if (idx === history.length) draft = input.value;
+        idx -= 1;
+        input.value = history[idx];
+      } else {
+        if (idx === history.length) return;
+        idx += 1;
+        input.value = idx === history.length ? draft : history[idx];
+      }
+      ev.preventDefault();
+      input.setSelectionRange(input.value.length, input.value.length);
+    });
+  })();
 </script>
 {% endblock %}

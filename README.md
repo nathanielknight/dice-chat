@@ -36,6 +36,9 @@ of the de facto Roll20 conventions:
 - `8d10>=7` — count successes (`>` and `<` are strict)
 - `dF` — Fate dice, `d%` — percentile
 
+In the composer, Up/Down arrows scroll back through your recent rolls
+(shell-style; kept per browser, per room).
+
 Editing a text message replaces its body; editing a roll **re-rolls it**
 with fresh randomness. Anyone in the room can edit any message — it's a
 casual-play trust model.

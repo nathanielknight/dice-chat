@@ -6,8 +6,11 @@
 <form id="composer" class="composer" hx-post="/r/{{ token }}/messages" hx-swap="outerHTML">
   {% if let Some(error) = error %}<p class="error">{{ error }}</p>{% endif %}
   <div class="composer-row">
-    <input name="body" value="{{ draft }}" maxlength="2000" autocomplete="off" autofocus
-           placeholder="Say something, or /roll 2d6+3">
+    <input class="expr-input" name="expr" value="{{ expr_draft }}" maxlength="200"
+           autocomplete="off" autofocus spellcheck="false"
+           aria-label="Dice roll" placeholder="&#127922; 2d6+3">
+    <input class="comment-input" name="comment" value="{{ comment_draft }}" maxlength="2000"
+           autocomplete="off" aria-label="Comment" placeholder="Say something (optional)">
     <button class="primary">Send</button>
   </div>
 </form>

@@ -8,6 +8,9 @@
             hx-target="#msg-{{ seq }}" hx-swap="outerHTML">edit</button>
     {% endif %}
   </div>
+  {% if !comment.is_empty() %}
+  <p class="msg-body">{{ comment }}</p>
+  {% endif %}
   {% if let Some(roll) = roll %}
   <div class="roll-body">
     <span class="roll-expr">&#127922; {{ roll.expr }}</span>
@@ -34,7 +37,5 @@
     </span>
     <span class="roll-total">= <b>{{ roll.total }}</b></span>
   </div>
-  {% else %}
-  <p class="msg-body">{{ body }}</p>
   {% endif %}
 </li>

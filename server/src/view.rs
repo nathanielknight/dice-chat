@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use askama::Template;
 
 use crate::clock::format_utc;
-use crate::store::{Message, MessageKind};
+use crate::store::Message;
 
 /// Display name for a client id, falling back to a stable anonymous handle.
 pub fn display_name(names: &HashMap<String, String>, client_id: &str) -> String {
@@ -46,16 +46,29 @@ pub struct Composer {
     pub locked: bool,
     pub error: Option<String>,
     /// Preserved input on error, so nothing typed is lost.
-    pub draft: String,
+    pub expr_draft: String,
+    pub comment_draft: String,
 }
 
 impl Composer {
     pub fn fresh(token: &str, locked: bool) -> Self {
-        Composer { token: token.into(), locked, error: None, draft: String::new() }
+        Composer {
+            token: token.into(),
+            locked,
+            error: None,
+            expr_draft: String::new(),
+            comment_draft: String::new(),
+        }
     }
 
-    pub fn with_error(token: &str, error: String, draft: String) -> Self {
-        Composer { token: token.into(), locked: false, error: Some(error), draft }
+    pub fn with_error(token: &str, error: String, expr: &str, comment: &str) -> Self {
+        Composer {
+            token: token.into(),
+            locked: false,
+            error: Some(error),
+            expr_draft: expr.into(),
+            comment_draft: comment.into(),
+        }
     }
 }
 
@@ -72,9 +85,9 @@ pub struct NameForm {
 pub struct EditForm {
     pub token: String,
     pub seq: i64,
-    pub is_roll: bool,
-    /// Current text body, or the roll expression without the `/roll` prefix.
-    pub value: String,
+    /// The roll expression, empty when the message has no roll.
+    pub expr: String,
+    pub comment: String,
     pub error: Option<String>,
 }
 
@@ -87,7 +100,8 @@ pub struct MessageView {
     pub created_fmt: String,
     /// Name of the last editor, when the message has been edited.
     pub edited_by: Option<String>,
-    pub body: String,
+    /// Free-text comment; empty when the message is a bare roll.
+    pub comment: String,
     pub roll: Option<RollView>,
     /// Render as an out-of-band swap (SSE edit events).
     pub oob: bool,
@@ -129,17 +143,14 @@ impl MessageView {
         locked: bool,
         oob: bool,
     ) -> Self {
-        let roll = match msg.kind {
-            MessageKind::Text => None,
-            MessageKind::Roll => Some(roll_view(msg)),
-        };
+        let roll = msg.expr.as_deref().map(|expr| roll_view(msg, expr));
         MessageView {
             token: token.into(),
             seq: msg.seq,
             author_name: display_name(names, &msg.author),
             created_fmt: format_utc(msg.created_at),
             edited_by: msg.edited().then(|| display_name(names, &msg.updated_by)),
-            body: msg.body.clone(),
+            comment: msg.comment.clone(),
             roll,
             oob,
             locked,
@@ -147,7 +158,7 @@ impl MessageView {
     }
 }
 
-fn roll_view(msg: &Message) -> RollView {
+fn roll_view(msg: &Message, expr: &str) -> RollView {
     let total = msg.total.unwrap_or(0);
     let outcome: Option<dice::Outcome> =
         msg.roll_json.as_deref().and_then(|j| serde_json::from_str(j).ok());
@@ -166,7 +177,7 @@ fn roll_view(msg: &Message) -> RollView {
             }
         }
     }
-    RollView { expr: msg.body.clone(), total, parts }
+    RollView { expr: expr.to_owned(), total, parts }
 }
 
 fn roll_part(op: &'static str, term: &dice::TermOutcome) -> RollPart {

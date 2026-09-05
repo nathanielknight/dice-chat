@@ -9,7 +9,9 @@ use std::collections::HashMap;
 
 use tokio_postgres::{Client, NoTls, Row};
 
-use super::{eval_with_state, Message, MessageKind, Room, RollAttempt, Store, StoreError, StoreResult};
+use super::{
+    eval_with_state, Message, MessageAttempt, Room, RollInput, Store, StoreError, StoreResult,
+};
 
 impl From<tokio_postgres::Error> for StoreError {
     fn from(e: tokio_postgres::Error) -> Self {
@@ -46,8 +48,8 @@ CREATE TABLE IF NOT EXISTS messages (
     room_id           BIGINT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     seq               BIGINT NOT NULL,
     author            TEXT NOT NULL,
-    kind              TEXT NOT NULL CHECK (kind IN ('text', 'roll')),
-    body              TEXT NOT NULL,
+    expr              TEXT,
+    comment           TEXT NOT NULL,
     roll_json         TEXT,
     total             BIGINT,
     created_at        BIGINT NOT NULL,
@@ -69,8 +71,38 @@ impl PostgresStore {
             }
         });
         client.batch_execute(SCHEMA).await?;
+        migrate(&client).await?;
         Ok(PostgresStore { client: tokio::sync::Mutex::new(client) })
     }
+}
+
+/// Bring a pre-`expr`/`comment` database (messages as `kind` + `body`)
+/// forward: rolls keep their expression, text messages become comments.
+async fn migrate(client: &Client) -> StoreResult<()> {
+    let legacy: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'messages' AND column_name = 'kind')",
+            &[],
+        )
+        .await?
+        .get(0);
+    if !legacy {
+        return Ok(());
+    }
+    client
+        .batch_execute(
+            "BEGIN;
+             ALTER TABLE messages ADD COLUMN expr TEXT;
+             ALTER TABLE messages ADD COLUMN comment TEXT NOT NULL DEFAULT '';
+             UPDATE messages SET expr = body WHERE kind = 'roll';
+             UPDATE messages SET comment = body WHERE kind = 'text';
+             ALTER TABLE messages DROP COLUMN kind;
+             ALTER TABLE messages DROP COLUMN body;
+             COMMIT;",
+        )
+        .await?;
+    Ok(())
 }
 
 fn room_from_row(row: &Row) -> Room {
@@ -84,13 +116,12 @@ fn room_from_row(row: &Row) -> Room {
 }
 
 fn message_from_row(row: &Row) -> Message {
-    let kind: &str = row.get(3);
     Message {
         room_id: row.get(0),
         seq: row.get(1),
         author: row.get(2),
-        kind: if kind == "roll" { MessageKind::Roll } else { MessageKind::Text },
-        body: row.get(4),
+        expr: row.get(3),
+        comment: row.get(4),
         roll_json: row.get(5),
         total: row.get(6),
         created_at: row.get(7),
@@ -101,8 +132,31 @@ fn message_from_row(row: &Row) -> Message {
     }
 }
 
-const MESSAGE_COLS: &str = "room_id, seq, author, kind, body, roll_json, total, \
+const MESSAGE_COLS: &str = "room_id, seq, author, expr, comment, roll_json, total, \
      created_at, updated_at, updated_by, created_event_seq, event_seq";
+
+/// Evaluate a message's roll (if any) against the room's RNG, returning the
+/// columns to write and the successor RNG state. `Ok(Err(_))` is an eval
+/// error: the caller drops the transaction, persisting nothing.
+type RollColumns = (Option<String>, Option<i64>, Option<[u8; crate::rng::STATE_LEN]>);
+
+async fn eval_roll(
+    tx: &tokio_postgres::Transaction<'_>,
+    room_id: i64,
+    roll: &Option<RollInput>,
+) -> StoreResult<Result<RollColumns, dice::EvalError>> {
+    let Some(roll) = roll else {
+        return Ok(Ok((None, None, None)));
+    };
+    let state = rng_state_for_update(tx, room_id).await?;
+    let (outcome, next_state) = match eval_with_state(&state, &roll.expr)? {
+        Ok(ok) => ok,
+        Err(e) => return Ok(Err(e)),
+    };
+    let roll_json = serde_json::to_string(&outcome)
+        .map_err(|e| StoreError(format!("serialize outcome: {e}")))?;
+    Ok(Ok((Some(roll_json), Some(outcome.value), Some(next_state))))
+}
 
 /// Bump the room's counters, returning `(next_seq, next_event_seq)`.
 async fn bump_counters(
@@ -211,58 +265,48 @@ impl Store for PostgresStore {
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    async fn post_text(&self, room_id: i64, author: &str, body: &str, now: i64) -> StoreResult<Message> {
-        let mut client = self.client.lock().await;
-        let tx = client.transaction().await?;
-        let (seq, event_seq) = bump_counters(&tx, room_id, true).await?;
-        let row = tx
-            .query_one(
-                &format!(
-                    "INSERT INTO messages (room_id, seq, author, kind, body,
-                         created_at, updated_at, updated_by, created_event_seq, event_seq)
-                     VALUES ($1, $2, $3, 'text', $4, $5, $5, $3, $6, $6)
-                     RETURNING {MESSAGE_COLS}"
-                ),
-                &[&room_id, &seq, &author, &body, &now, &event_seq],
-            )
-            .await?;
-        let msg = message_from_row(&row);
-        tx.commit().await?;
-        Ok(msg)
-    }
-
-    async fn post_roll(
+    async fn post_message(
         &self,
         room_id: i64,
         author: &str,
-        expr_src: &str,
-        expr: &dice::Expr,
+        roll: Option<RollInput>,
+        comment: &str,
         now: i64,
-    ) -> StoreResult<RollAttempt> {
+    ) -> StoreResult<MessageAttempt> {
         let mut client = self.client.lock().await;
         let tx = client.transaction().await?;
-        let state = rng_state_for_update(&tx, room_id).await?;
-        let (outcome, next_state) = match eval_with_state(&state, expr)? {
-            Ok(ok) => ok,
+        let (roll_json, total, next_state) = match eval_roll(&tx, room_id, &roll).await? {
+            Ok(cols) => cols,
             Err(e) => return Ok(Err(e)), // tx dropped → rollback
         };
-        let roll_json = serde_json::to_string(&outcome)
-            .map_err(|e| StoreError(format!("serialize outcome: {e}")))?;
         let (seq, event_seq) = bump_counters(&tx, room_id, true).await?;
-        tx.execute(
-            "UPDATE rooms SET rng_state = $1 WHERE id = $2",
-            &[&&next_state[..], &room_id],
-        )
-        .await?;
+        if let Some(next_state) = next_state {
+            tx.execute(
+                "UPDATE rooms SET rng_state = $1 WHERE id = $2",
+                &[&&next_state[..], &room_id],
+            )
+            .await?;
+        }
+        let expr_src = roll.as_ref().map(|r| r.src.clone());
         let row = tx
             .query_one(
                 &format!(
-                    "INSERT INTO messages (room_id, seq, author, kind, body, roll_json, total,
+                    "INSERT INTO messages (room_id, seq, author, expr, comment, roll_json, total,
                          created_at, updated_at, updated_by, created_event_seq, event_seq)
-                     VALUES ($1, $2, $3, 'roll', $4, $5, $6, $7, $7, $3, $8, $8)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $3, $9, $9)
                      RETURNING {MESSAGE_COLS}"
                 ),
-                &[&room_id, &seq, &author, &expr_src, &roll_json, &outcome.value, &now, &event_seq],
+                &[
+                    &room_id,
+                    &seq,
+                    &author,
+                    &expr_src,
+                    &comment,
+                    &roll_json,
+                    &total,
+                    &now,
+                    &event_seq,
+                ],
             )
             .await?;
         let msg = message_from_row(&row);
@@ -270,77 +314,46 @@ impl Store for PostgresStore {
         Ok(Ok(msg))
     }
 
-    async fn edit_text(
+    async fn edit_message(
         &self,
         room_id: i64,
         seq: i64,
         editor: &str,
-        body: &str,
+        roll: Option<RollInput>,
+        comment: &str,
         now: i64,
-    ) -> StoreResult<Option<Message>> {
+    ) -> StoreResult<Option<MessageAttempt>> {
         let mut client = self.client.lock().await;
         let tx = client.transaction().await?;
-        let Some(existing) = get_message_tx(&tx, room_id, seq).await? else {
-            return Ok(None);
-        };
-        if existing.kind != MessageKind::Text {
+        if get_message_tx(&tx, room_id, seq).await?.is_none() {
             return Ok(None);
         }
-        let (_, event_seq) = bump_counters(&tx, room_id, false).await?;
-        let row = tx
-            .query_one(
-                &format!(
-                    "UPDATE messages SET body = $1, updated_at = $2, updated_by = $3, event_seq = $4
-                     WHERE room_id = $5 AND seq = $6
-                     RETURNING {MESSAGE_COLS}"
-                ),
-                &[&body, &now, &editor, &event_seq, &room_id, &seq],
-            )
-            .await?;
-        let msg = message_from_row(&row);
-        tx.commit().await?;
-        Ok(Some(msg))
-    }
-
-    async fn edit_roll(
-        &self,
-        room_id: i64,
-        seq: i64,
-        editor: &str,
-        expr_src: &str,
-        expr: &dice::Expr,
-        now: i64,
-    ) -> StoreResult<Option<RollAttempt>> {
-        let mut client = self.client.lock().await;
-        let tx = client.transaction().await?;
-        let Some(existing) = get_message_tx(&tx, room_id, seq).await? else {
-            return Ok(None);
-        };
-        if existing.kind != MessageKind::Roll {
-            return Ok(None);
-        }
-        let state = rng_state_for_update(&tx, room_id).await?;
-        let (outcome, next_state) = match eval_with_state(&state, expr)? {
-            Ok(ok) => ok,
+        // Editing a roll re-rolls it with fresh randomness (SPEC.md §5).
+        let (roll_json, total, next_state) = match eval_roll(&tx, room_id, &roll).await? {
+            Ok(cols) => cols,
             Err(e) => return Ok(Some(Err(e))),
         };
-        let roll_json = serde_json::to_string(&outcome)
-            .map_err(|e| StoreError(format!("serialize outcome: {e}")))?;
         let (_, event_seq) = bump_counters(&tx, room_id, false).await?;
-        tx.execute(
-            "UPDATE rooms SET rng_state = $1 WHERE id = $2",
-            &[&&next_state[..], &room_id],
-        )
-        .await?;
+        if let Some(next_state) = next_state {
+            tx.execute(
+                "UPDATE rooms SET rng_state = $1 WHERE id = $2",
+                &[&&next_state[..], &room_id],
+            )
+            .await?;
+        }
+        let expr_src = roll.as_ref().map(|r| r.src.clone());
         let row = tx
             .query_one(
                 &format!(
-                    "UPDATE messages SET body = $1, roll_json = $2, total = $3,
-                         updated_at = $4, updated_by = $5, event_seq = $6
-                     WHERE room_id = $7 AND seq = $8
+                    "UPDATE messages SET expr = $1, comment = $2, roll_json = $3, total = $4,
+                         updated_at = $5, updated_by = $6, event_seq = $7
+                     WHERE room_id = $8 AND seq = $9
                      RETURNING {MESSAGE_COLS}"
                 ),
-                &[&expr_src, &roll_json, &outcome.value, &now, &editor, &event_seq, &room_id, &seq],
+                &[
+                    &expr_src, &comment, &roll_json, &total, &now, &editor, &event_seq, &room_id,
+                    &seq,
+                ],
             )
             .await?;
         let msg = message_from_row(&row);

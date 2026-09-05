@@ -58,14 +58,19 @@ Backend selection at startup by connection string (`sqlite://path.db` or
 
 - All clients in a room can view, post, and **edit** messages (any message,
   including others' — casual-play trust model).
-- Message types:
-  - **Text** — plain chat.
-  - **Roll** — created by posting `/roll <expression>`; stores the
-    expression, structured results, and rendered total. No attached
-    commentary — context goes in an ordinary message before the roll.
-- Editing a text message replaces its body.
-- Editing a roll message **re-rolls it** (e.g. to fix a fat-fingered die
-  size). Fresh randomness is drawn; previous results are replaced.
+- A message carries a **roll**, a **comment**, or both:
+  - The **roll** is a dice expression (§8); the message stores the
+    expression as typed, structured results, and the rendered total.
+  - The **comment** is free text. On a message with a roll it labels the
+    roll ("Attack", "Start of combat"); on its own it is plain chat.
+  - At least one of the two must be present.
+- The composer has a separate input for each, so rolling — the common case
+  — takes no prefix or command. There are no chat commands; a leading
+  slash is ordinary text.
+- Editing replaces the comment, and **re-rolls** any roll the saved message
+  has (e.g. to fix a fat-fingered die size): fresh randomness is drawn and
+  previous results are replaced. An edit may also add a roll to a message
+  that had none, or drop the roll from one that did.
 - Messages are ordered by server-assigned sequence per room.
 - Every message tracks `created_at`, `updated_at`, and `updated_by`
   (client id). Edited messages show an indicator in the UI (e.g.

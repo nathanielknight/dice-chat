@@ -136,11 +136,49 @@ impl std::fmt::Display for EvalError {
 impl std::error::Error for EvalError {}
 
 // ---------------------------------------------------------------- parser
+//
+// Built on nom. Errors carry the remaining input at the point of failure
+// (always a suffix of the full input), so the 1-based column is recovered
+// at the top level as `full.len() - at.len() + 1`. Semantic errors use
+// `Err::Failure` (or sit inside a `cut`) so `alt`/`many0` don't backtrack
+// past them and lose the message.
 
-struct Parser<'a> {
-    src: &'a [u8],
-    pos: usize,
+use nom::branch::alt;
+use nom::bytes::complete::tag;
+use nom::character::complete::{char as chr, digit1};
+use nom::combinator::{cut, map, opt, value};
+use nom::multi::many0;
+use nom::sequence::preceded;
+use nom::{Err as NErr, IResult, Parser as _};
+
+#[derive(Debug)]
+struct PErr<'a> {
+    /// Remaining input at the error (a suffix of the full input).
+    at: &'a str,
+    msg: String,
 }
+
+impl<'a> PErr<'a> {
+    fn err(at: &'a str, msg: impl Into<String>) -> NErr<Self> {
+        NErr::Error(PErr { at, msg: msg.into() })
+    }
+
+    fn fail(at: &'a str, msg: impl Into<String>) -> NErr<Self> {
+        NErr::Failure(PErr { at, msg: msg.into() })
+    }
+}
+
+impl<'a> nom::error::ParseError<&'a str> for PErr<'a> {
+    fn from_error_kind(input: &'a str, _: nom::error::ErrorKind) -> Self {
+        PErr { at: input, msg: "unexpected input".into() }
+    }
+
+    fn append(_: &'a str, _: nom::error::ErrorKind, other: Self) -> Self {
+        other
+    }
+}
+
+type PResult<'a, T> = IResult<&'a str, T, PErr<'a>>;
 
 /// Parse a dice expression. See SPEC.md §8 for the grammar.
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
@@ -153,285 +191,272 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
             .unwrap_or(1);
         return Err(ParseError { msg: "unexpected non-ASCII character".into(), col });
     }
-    let mut p = Parser { src: input.as_bytes(), pos: 0 };
-    let expr = p.expr()?;
-    p.skip_ws();
-    if p.pos < p.src.len() {
-        return Err(p.err_here("unexpected trailing input"));
+    match expr(input) {
+        Ok((rest, e)) => {
+            let rest = rest.trim_start_matches([' ', '\t']);
+            if rest.is_empty() {
+                Ok(e)
+            } else {
+                Err(ParseError {
+                    msg: "unexpected trailing input".into(),
+                    col: input.len() - rest.len() + 1,
+                })
+            }
+        }
+        Err(NErr::Error(e)) | Err(NErr::Failure(e)) => {
+            Err(ParseError { msg: e.msg, col: input.len() - e.at.len() + 1 })
+        }
+        Err(NErr::Incomplete(_)) => unreachable!("complete parsers only"),
     }
-    Ok(expr)
 }
 
-impl<'a> Parser<'a> {
-    fn err_here(&self, msg: &str) -> ParseError {
-        ParseError { msg: msg.into(), col: self.pos + 1 }
-    }
+fn ws(i: &str) -> PResult<'_, ()> {
+    Ok((i.trim_start_matches([' ', '\t']), ()))
+}
 
-    fn err_at(&self, msg: &str, pos: usize) -> ParseError {
-        ParseError { msg: msg.into(), col: pos + 1 }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.src.get(self.pos).copied()
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
-            self.pos += 1;
-        }
-    }
-
-    fn eat(&mut self, s: &str) -> bool {
-        if self.src[self.pos..].starts_with(s.as_bytes()) {
-            self.pos += s.len();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn integer(&mut self, what: &str) -> Result<u64, ParseError> {
-        let start = self.pos;
-        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-            self.pos += 1;
-        }
-        if self.pos == start {
-            return Err(self.err_here(&format!("expected {what}")));
-        }
-        std::str::from_utf8(&self.src[start..self.pos])
-            .unwrap()
+fn integer<'a>(what: &'static str) -> impl FnMut(&'a str) -> PResult<'a, u64> {
+    move |i| {
+        let (rest, digits) =
+            digit1(i).map_err(|_: NErr<PErr>| PErr::err(i, format!("expected {what}")))?;
+        let n = digits
             .parse::<u64>()
-            .map_err(|_| self.err_at(&format!("{what} is too large"), start))
+            .map_err(|_| PErr::fail(i, format!("{what} is too large")))?;
+        Ok((rest, n))
+    }
+}
+
+// expr := product (("+" | "-") product)*
+fn expr(i: &str) -> PResult<'_, Expr> {
+    let (i, _) = ws(i)?;
+    let (i, first) = product(i)?;
+    let (i, more) = many0(|i| {
+        let (i, _) = ws(i)?;
+        let (i, op) = alt((value(AddOp::Add, chr('+')), value(AddOp::Sub, chr('-')))).parse(i)?;
+        let (i, _) = ws(i)?;
+        let (i, p) = cut(product).parse(i)?;
+        Ok((i, (op, p)))
+    })
+    .parse(i)?;
+
+    let mut out = vec![(AddOp::Add, first)];
+    out.extend(more);
+    let n: usize = out.iter().map(|(_, p)| p.0.len()).sum();
+    if n > MAX_TERMS {
+        return Err(PErr::fail(i, "too many terms in expression"));
+    }
+    Ok((i, Expr(out)))
+}
+
+// product := term ("*" term)*
+fn product(i: &str) -> PResult<'_, Product> {
+    let (i, first) = term(i)?;
+    let (i, more) = many0(|i| {
+        let (i, _) = ws(i)?;
+        let (i, _) = chr('*').parse(i)?;
+        let (i, _) = ws(i)?;
+        cut(term).parse(i)
+    })
+    .parse(i)?;
+
+    let mut out = vec![first];
+    out.extend(more);
+    if out.len() > MAX_TERMS {
+        return Err(PErr::fail(i, "too many terms in expression"));
+    }
+    Ok((i, Product(out)))
+}
+
+// term := dice | integer
+fn term(i: &str) -> PResult<'_, Term> {
+    if i.is_empty() {
+        return Err(PErr::err(i, "expected a number or dice term, found end of input"));
+    }
+    alt((dice_term, const_term)).parse(i).map_err(|e| match e {
+        NErr::Error(_) => PErr::err(i, "expected a number or dice term"),
+        other => other,
+    })
+}
+
+fn const_term(i: &str) -> PResult<'_, Term> {
+    let (rest, n) = integer("a number")(i)?;
+    let n = i64::try_from(n).map_err(|_| PErr::fail(i, "number is too large"))?;
+    Ok((rest, Term::Const(n)))
+}
+
+// dice := integer? "d" sides suffix*
+fn dice_term(i: &str) -> PResult<'_, Term> {
+    let (rest, count) = opt(integer("a number")).parse(i)?;
+    let (rest, _) = chr('d').parse(rest)?;
+    // Past the 'd' this is definitely a dice term: cut so errors surface
+    // instead of backtracking into the constant alternative.
+    let (rest, dt) = cut(move |r| dice_body(r, count, i)).parse(rest)?;
+    Ok((rest, Term::Dice(dt)))
+}
+
+fn dice_body<'a>(i: &'a str, count: Option<u64>, term_start: &'a str) -> PResult<'a, DiceTerm> {
+    let count = count.unwrap_or(1);
+    if count == 0 {
+        return Err(PErr::err(term_start, "dice count must be at least 1"));
+    }
+    if count > MAX_DICE_PER_TERM as u64 {
+        return Err(PErr::err(
+            term_start,
+            format!("at most {MAX_DICE_PER_TERM} dice per term"),
+        ));
     }
 
-    // expr := product (("+" | "-") product)*
-    fn expr(&mut self) -> Result<Expr, ParseError> {
-        let mut out = Vec::new();
-        self.skip_ws();
-        out.push((AddOp::Add, self.product()?));
-        loop {
-            self.skip_ws();
-            let op = match self.peek() {
-                Some(b'+') => AddOp::Add,
-                Some(b'-') => AddOp::Sub,
-                _ => break,
-            };
-            self.pos += 1;
-            self.skip_ws();
-            out.push((op, self.product()?));
-            let n: usize = out.iter().map(|(_, p)| p.0.len()).sum();
-            if n > MAX_TERMS {
-                return Err(self.err_here("too many terms in expression"));
+    let (i, sides) = sides(i)?;
+    let (i, suffixes) = many0(suffix).parse(i)?;
+
+    let mut term = DiceTerm {
+        count: count as u32,
+        sides,
+        reroll: None,
+        explode: false,
+        keep: None,
+        success: None,
+    };
+    for (at, s) in suffixes {
+        apply_suffix(&mut term, at, s)?;
+    }
+    Ok((i, term))
+}
+
+fn sides(i: &str) -> PResult<'_, Sides> {
+    alt((
+        value(Sides::Fate, chr('F')),
+        value(Sides::Faces(100), chr('%')),
+        faces,
+    ))
+    .parse(i)
+    .map_err(|e| match e {
+        NErr::Error(_) => PErr::err(i, "expected die size after 'd' (a number, 'F', or '%')"),
+        other => other,
+    })
+}
+
+fn faces(i: &str) -> PResult<'_, Sides> {
+    let (rest, n) = integer("die size")(i)?;
+    if n < 2 {
+        return Err(PErr::fail(i, "a die needs at least 2 sides"));
+    }
+    if n > MAX_SIDES as u64 {
+        return Err(PErr::fail(i, format!("at most {MAX_SIDES} sides per die")));
+    }
+    Ok((rest, Sides::Faces(n as u32)))
+}
+
+/// A parsed-but-unvalidated suffix; validation happens in [`apply_suffix`]
+/// where the whole term is in view.
+#[derive(Debug, Clone, Copy)]
+enum Suffix {
+    Keep(KeepKind, u64),
+    /// `adv`/`dis` sugar: d20adv ≡ 2d20kh1.
+    AdvDis(KeepKind),
+    Reroll(RerollKind, u64),
+    Explode,
+    Success(Cmp, u64),
+}
+
+fn suffix(i: &str) -> PResult<'_, (&str, Suffix)> {
+    // Longest-match keyword order matters: "ro" before "r", ">=" before ">".
+    // Numbers after a keyword are cut: "4d6kh" is an error, not trailing input.
+    let (rest, s) = alt((
+        map(preceded(tag("kh"), cut(integer("a count after keep/drop"))), |n| {
+            Suffix::Keep(KeepKind::KeepHighest, n)
+        }),
+        map(preceded(tag("kl"), cut(integer("a count after keep/drop"))), |n| {
+            Suffix::Keep(KeepKind::KeepLowest, n)
+        }),
+        map(preceded(tag("dh"), cut(integer("a count after keep/drop"))), |n| {
+            Suffix::Keep(KeepKind::DropHighest, n)
+        }),
+        map(preceded(tag("dl"), cut(integer("a count after keep/drop"))), |n| {
+            Suffix::Keep(KeepKind::DropLowest, n)
+        }),
+        value(Suffix::AdvDis(KeepKind::KeepHighest), tag("adv")),
+        value(Suffix::AdvDis(KeepKind::KeepLowest), tag("dis")),
+        map(preceded(tag("ro"), cut(integer("a threshold after reroll"))), |n| {
+            Suffix::Reroll(RerollKind::Once, n)
+        }),
+        map(preceded(tag("r"), cut(integer("a threshold after reroll"))), |n| {
+            Suffix::Reroll(RerollKind::Indefinite, n)
+        }),
+        value(Suffix::Explode, chr('!')),
+        map(preceded(tag(">="), cut(integer("a target after the comparison"))), |n| {
+            Suffix::Success(Cmp::Ge, n)
+        }),
+        map(preceded(tag("<="), cut(integer("a target after the comparison"))), |n| {
+            Suffix::Success(Cmp::Le, n)
+        }),
+        map(preceded(tag(">"), cut(integer("a target after the comparison"))), |n| {
+            Suffix::Success(Cmp::Gt, n)
+        }),
+        map(preceded(tag("<"), cut(integer("a target after the comparison"))), |n| {
+            Suffix::Success(Cmp::Lt, n)
+        }),
+    ))
+    .parse(i)?;
+    Ok((rest, (i, s)))
+}
+
+/// Suffixes apply in writing order; a fixed semantic order governs
+/// evaluation, so `4d6kh3!` and `4d6!kh3` produce the same term.
+fn apply_suffix<'a>(term: &mut DiceTerm, at: &'a str, s: Suffix) -> Result<(), NErr<PErr<'a>>> {
+    match s {
+        Suffix::Keep(kind, n) => {
+            if term.keep.is_some() {
+                return Err(PErr::err(at, "only one keep/drop suffix per term"));
             }
-        }
-        Ok(Expr(out))
-    }
-
-    // product := term ("*" term)*
-    fn product(&mut self) -> Result<Product, ParseError> {
-        let mut out = vec![self.term()?];
-        loop {
-            self.skip_ws();
-            if self.peek() == Some(b'*') {
-                self.pos += 1;
-                self.skip_ws();
-                out.push(self.term()?);
-                if out.len() > MAX_TERMS {
-                    return Err(self.err_here("too many terms in expression"));
-                }
-            } else {
-                break;
+            if n == 0 || n > term.count as u64 {
+                return Err(PErr::err(
+                    at,
+                    format!("keep/drop count must be between 1 and {}", term.count),
+                ));
             }
+            term.keep = Some((kind, n as u32));
         }
-        Ok(Product(out))
-    }
-
-    // term := dice | integer
-    fn term(&mut self) -> Result<Term, ParseError> {
-        let start = self.pos;
-        match self.peek() {
-            Some(b'd') => self.dice(1, start).map(Term::Dice),
-            Some(c) if c.is_ascii_digit() => {
-                let n = self.integer("a number")?;
-                if self.peek() == Some(b'd') {
-                    if n > MAX_DICE_PER_TERM as u64 {
-                        return Err(self.err_at(
-                            &format!("at most {MAX_DICE_PER_TERM} dice per term"),
-                            start,
-                        ));
-                    }
-                    self.dice(n as u32, start).map(Term::Dice)
-                } else {
-                    i64::try_from(n)
-                        .map(Term::Const)
-                        .map_err(|_| self.err_at("number is too large", start))
-                }
+        Suffix::AdvDis(kind) => {
+            if term.count != 1 {
+                return Err(PErr::err(
+                    at,
+                    "'adv'/'dis' only applies to a single die (e.g. d20adv)",
+                ));
             }
-            Some(_) => Err(self.err_here("expected a number or dice term")),
-            None => Err(self.err_here("expected a number or dice term, found end of input")),
-        }
-    }
-
-    // dice := <count already parsed> "d" sides suffix*
-    fn dice(&mut self, count: u32, term_start: usize) -> Result<DiceTerm, ParseError> {
-        debug_assert_eq!(self.peek(), Some(b'd'));
-        self.pos += 1; // consume 'd'
-
-        if count == 0 {
-            return Err(self.err_at("dice count must be at least 1", term_start));
-        }
-
-        let sides = match self.peek() {
-            Some(b'F') => {
-                self.pos += 1;
-                Sides::Fate
+            if term.keep.is_some() {
+                return Err(PErr::err(at, "'adv'/'dis' cannot combine with keep/drop"));
             }
-            Some(b'%') => {
-                self.pos += 1;
-                Sides::Faces(100)
+            term.count = 2;
+            term.keep = Some((kind, 1));
+        }
+        Suffix::Reroll(kind, n) => {
+            if term.sides == Sides::Fate {
+                return Err(PErr::err(at, "Fate dice cannot be rerolled"));
             }
-            Some(c) if c.is_ascii_digit() => {
-                let sides_start = self.pos;
-                let n = self.integer("die size")?;
-                if n < 2 {
-                    return Err(self.err_at("a die needs at least 2 sides", sides_start));
-                }
-                if n > MAX_SIDES as u64 {
-                    return Err(self.err_at(
-                        &format!("at most {MAX_SIDES} sides per die"),
-                        sides_start,
-                    ));
-                }
-                Sides::Faces(n as u32)
+            if term.reroll.is_some() {
+                return Err(PErr::err(at, "only one reroll suffix per term"));
             }
-            _ => return Err(self.err_here("expected die size after 'd' (a number, 'F', or '%')")),
-        };
-
-        let mut term = DiceTerm {
-            count,
-            sides,
-            reroll: None,
-            explode: false,
-            keep: None,
-            success: None,
-        };
-
-        loop {
-            let suffix_start = self.pos;
-            // Longest-match keyword order matters: "kh" before nothing else
-            // starts with 'k'; "ro" before "r"; "dh"/"dl"/"dis" before bare 'd'
-            // (a bare 'd' here is an error anyway — dice terms don't chain).
-            if self.eat("kh") {
-                self.keep_suffix(&mut term, KeepKind::KeepHighest, suffix_start)?;
-            } else if self.eat("kl") {
-                self.keep_suffix(&mut term, KeepKind::KeepLowest, suffix_start)?;
-            } else if self.eat("dh") {
-                self.keep_suffix(&mut term, KeepKind::DropHighest, suffix_start)?;
-            } else if self.eat("dl") {
-                self.keep_suffix(&mut term, KeepKind::DropLowest, suffix_start)?;
-            } else if self.eat("adv") {
-                self.advantage(&mut term, KeepKind::KeepHighest, suffix_start)?;
-            } else if self.eat("dis") {
-                self.advantage(&mut term, KeepKind::KeepLowest, suffix_start)?;
-            } else if self.eat("ro") {
-                self.reroll_suffix(&mut term, RerollKind::Once, suffix_start)?;
-            } else if self.eat("r") {
-                self.reroll_suffix(&mut term, RerollKind::Indefinite, suffix_start)?;
-            } else if self.eat("!") {
-                if term.sides == Sides::Fate {
-                    return Err(self.err_at("Fate dice cannot explode", suffix_start));
-                }
-                if term.explode {
-                    return Err(self.err_at("duplicate '!' suffix", suffix_start));
-                }
-                term.explode = true;
-            } else if self.eat(">=") {
-                self.success_suffix(&mut term, Cmp::Ge, suffix_start)?;
-            } else if self.eat("<=") {
-                self.success_suffix(&mut term, Cmp::Le, suffix_start)?;
-            } else if self.eat(">") {
-                self.success_suffix(&mut term, Cmp::Gt, suffix_start)?;
-            } else if self.eat("<") {
-                self.success_suffix(&mut term, Cmp::Lt, suffix_start)?;
-            } else {
-                break;
+            let n = u32::try_from(n).map_err(|_| PErr::err(at, "reroll threshold is too large"))?;
+            term.reroll = Some((kind, n));
+        }
+        Suffix::Explode => {
+            if term.sides == Sides::Fate {
+                return Err(PErr::err(at, "Fate dice cannot explode"));
             }
+            if term.explode {
+                return Err(PErr::err(at, "duplicate '!' suffix"));
+            }
+            term.explode = true;
         }
-
-        Ok(term)
+        Suffix::Success(cmp, n) => {
+            if term.success.is_some() {
+                return Err(PErr::err(at, "only one success comparison per term"));
+            }
+            let n = i64::try_from(n).map_err(|_| PErr::err(at, "success target is too large"))?;
+            term.success = Some((cmp, n));
+        }
     }
-
-    fn keep_suffix(
-        &mut self,
-        term: &mut DiceTerm,
-        kind: KeepKind,
-        at: usize,
-    ) -> Result<(), ParseError> {
-        if term.keep.is_some() {
-            return Err(self.err_at("only one keep/drop suffix per term", at));
-        }
-        let n = self.integer("a count after keep/drop")?;
-        if n == 0 || n > term.count as u64 {
-            return Err(self.err_at(
-                &format!("keep/drop count must be between 1 and {}", term.count),
-                at,
-            ));
-        }
-        term.keep = Some((kind, n as u32));
-        Ok(())
-    }
-
-    fn advantage(
-        &mut self,
-        term: &mut DiceTerm,
-        kind: KeepKind,
-        at: usize,
-    ) -> Result<(), ParseError> {
-        // `adv`/`dis` is sugar valid only on a single die with no keep/drop:
-        // d20adv ≡ 2d20kh1.
-        if term.count != 1 {
-            return Err(self.err_at("'adv'/'dis' only applies to a single die (e.g. d20adv)", at));
-        }
-        if term.keep.is_some() {
-            return Err(self.err_at("'adv'/'dis' cannot combine with keep/drop", at));
-        }
-        term.count = 2;
-        term.keep = Some((kind, 1));
-        Ok(())
-    }
-
-    fn reroll_suffix(
-        &mut self,
-        term: &mut DiceTerm,
-        kind: RerollKind,
-        at: usize,
-    ) -> Result<(), ParseError> {
-        if term.sides == Sides::Fate {
-            return Err(self.err_at("Fate dice cannot be rerolled", at));
-        }
-        if term.reroll.is_some() {
-            return Err(self.err_at("only one reroll suffix per term", at));
-        }
-        let n = self.integer("a threshold after reroll")?;
-        let n = u32::try_from(n).map_err(|_| self.err_at("reroll threshold is too large", at))?;
-        term.reroll = Some((kind, n));
-        Ok(())
-    }
-
-    fn success_suffix(
-        &mut self,
-        term: &mut DiceTerm,
-        cmp: Cmp,
-        at: usize,
-    ) -> Result<(), ParseError> {
-        if term.success.is_some() {
-            return Err(self.err_at("only one success comparison per term", at));
-        }
-        let n = self.integer("a target after the comparison")?;
-        let n = i64::try_from(n).map_err(|_| self.err_at("success target is too large", at))?;
-        term.success = Some((cmp, n));
-        Ok(())
-    }
+    Ok(())
 }
 
 // ------------------------------------------------------------ rendering

@@ -6,4 +6,5 @@ license.workspace = true
 description = "Dice expression parser and evaluator (SPEC.md §8)"
 
 [dependencies]
+nom = "8.0.0"
 serde = { version = "1", features = ["derive"] }

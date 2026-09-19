@@ -6,7 +6,7 @@
 <main class="room" hx-ext="sse" sse-connect="/r/{{ token }}/events?last={{ snapshot_seq }}">
   <header>
     <div class="room-title">
-      <h1><a href="/">&#127922;</a> Dice Chat</h1>
+      <h1><a href="/">Dice Chat</a></h1>
       {% if locked %}
         <span class="locked-badge" title="No new messages, edits, or rolls">read-only</span>
       {% else %}

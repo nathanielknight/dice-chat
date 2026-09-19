@@ -13,7 +13,7 @@
   {% endif %}
   {% if let Some(roll) = roll %}
   <div class="roll-body">
-    <span class="roll-expr">&#127922; {{ roll.expr }}</span>
+    <span class="roll-expr">{{ roll.expr }}</span>
     <span class="roll-detail">
       {%- for part in roll.parts -%}
         {%- if !part.op.is_empty() %}<span class="roll-op">{{ part.op }}</span>{% endif -%}

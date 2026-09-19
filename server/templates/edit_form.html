@@ -6,7 +6,7 @@
       <input class="expr-input" name="expr" value="{{ expr }}" maxlength="200"
              autocomplete="off" spellcheck="false"{% if !expr.is_empty() %} autofocus
              title="Saving re-rolls with fresh dice"{% endif %}
-             aria-label="Dice roll" placeholder="&#127922; 2d6+3">
+             aria-label="Dice roll" placeholder="e.g. 2d6+3">
       <input class="comment-input" name="comment" value="{{ comment }}" maxlength="2000"
              autocomplete="off"{% if expr.is_empty() %} autofocus{% endif %}
              aria-label="Comment" placeholder="Comment (optional)">

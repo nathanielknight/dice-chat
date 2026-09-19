@@ -72,7 +72,6 @@ input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .home { padding-top: 3rem; }
 .home h1 { font-size: 2rem; }
 .home form { margin: 1.5rem 0; }
-.home .help { color: var(--muted); border-top: 1px solid var(--line); padding-top: 1rem; }
 
 /* ------------------------------------------------------------- room */
 .room {
